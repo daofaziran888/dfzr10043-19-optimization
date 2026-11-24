@@ -543,67 +543,161 @@ def ocr_capture_to_sample_check(ocr_id: int, batch_id: int) -> dict[str, Any]:
 
 
 # ── 链路10: 运行指标汇总 → 执行实例逐条核对 → 审计轨迹 ─
+#
+# 汇总核对的并发与迟到语义：
+# - 每次汇总深拷贝当时的执行集合，按快照指纹判重，相同核对只保留一份
+#   核对证据与一条审计（重复命中累计复用次数，不新增审计）。
+# - defer_audit=True 时只登记证据并预留汇总序号、暂缓审计提交，
+#   之后由 commit_metric_summary 提交；提交时若已有更新的汇总落地，
+#   该迟到提交被拒收，当前读数不会被退回，旧证据仍可追查。
+# - 证据只追加不覆盖，读数凭单调递增的汇总序号向前推进。
 
-def summarize_metrics(metric_id: int) -> dict[str, Any]:
-    """按统计窗口汇总流程执行指标，逐条核对手实例数据，发现不一致写审计轨迹。"""
-    metric_svc = service_for("metric_board")
-    metric = _find_entry("metric_board", metric_id)
-    metric_svc.run_action(metric_id, "触发汇总")
-
-    # 获取执行实例数据做逐条核对
-    run_svc = service_for("flow_run")
-    all_runs = run_svc.list_entries(size=10000)[0]
-    completed = [r for r in all_runs if r.get("status") == "已完成"]
-    failed = [r for r in all_runs if r.get("status") == "执行失败"]
-
-    actual_success_rate = len(completed) / max(1, len(all_runs))
+def _build_check_result(metric: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """逐条核对指标声明成功率与执行集合实际成功率。"""
     stated_success_rate = float(metric.get("成功率", "0") or "0")
+    actual_success_rate = snapshot["success_rate"]
+    consistent = abs(actual_success_rate - stated_success_rate) <= 0.01
+    return {
+        "consistent": consistent,
+        "stated": stated_success_rate,
+        "actual": actual_success_rate,
+    }
 
-    # 核对一致性
-    tolerance = 0.01
-    mismatch = abs(actual_success_rate - stated_success_rate) > tolerance
 
-    if mismatch:
-        metric_svc.run_action(metric_id, "核对读数")
-
-        # 写审计轨迹记录不一致
-        audit_svc = service_for("audit_trail")
-        audit_values = {
-            "条目编号": f"AUDI-M{metric_id}",
-            "操作对象": f"运行指标.{metric.get('读数编号', '')}",
-            "操作类型": "指标核对",
-            "操作者标识": "system",
-            "操作时间": _now_iso(),
-            "变更摘要": (f"指标{metric.get('统计维度')}成功率{stated_success_rate}与执行实例"
-                         f"实际{actual_success_rate:.4f}不一致，窗口{metric.get('统计窗口')}"),
-            "关联执行": "",
-            "追溯标记": f"metric-mismatch-{_epoch_ms()}",
-        }
-        audit_result, _ = audit_svc.create_entry(audit_values)
-    else:
-        metric_svc.run_action(metric_id, "核对读数")
-
-    # 写审计轨迹记录汇总事件
+def _register_metric_audit(metric_id: int, metric: dict[str, Any],
+                           evidence: dict[str, Any], check_result: dict[str, Any],
+                           submission_state: str) -> tuple[dict[str, Any], bool]:
+    """按核对指纹登记/复用指标核对审计，并回写执行集合与核对结果。"""
     audit_svc = service_for("audit_trail")
+    run_codes = ",".join(ref.get("执行编号", "") for ref in evidence["执行集合"])
+    if check_result["consistent"]:
+        conclusion = "一致"
+        summary = (
+            f"指标{metric.get('统计维度')}窗口{metric.get('统计窗口')}"
+            f"核对一致：成功{evidence['成功数']}/{evidence['总数']}，"
+            f"成功率{evidence['成功率']:.4f}"
+        )
+    else:
+        conclusion = "不一致"
+        summary = (
+            f"指标{metric.get('统计维度')}声明成功率{check_result['stated']}"
+            f"与执行集合实际{check_result['actual']:.4f}不一致，"
+            f"当次成功{evidence['成功数']}/{evidence['总数']}，窗口{metric.get('统计窗口')}"
+        )
     audit_values = {
-        "条目编号": f"AUDI-M{metric_id}-SUM",
+        "条目编号": f"AUDI-M{metric_id}-{evidence['核对指纹']}",
         "操作对象": f"运行指标.{metric.get('读数编号', '')}",
-        "操作类型": "指标汇总",
+        "操作类型": "指标核对",
         "操作者标识": "system",
         "操作时间": _now_iso(),
-        "变更摘要": (f"维度{metric.get('统计维度')}窗口{metric.get('统计窗口')}"
-                     f"汇总：总执行{len(all_runs)}，成功{len(completed)}，"
-                     f"失败{len(failed)}，成功率{actual_success_rate:.4f}"),
-        "关联执行": "",
-        "追溯标记": f"metric-summary-{_epoch_ms()}",
+        "变更摘要": summary,
+        "关联执行": run_codes,
+        "追溯标记": f"metric-check-{metric_id}-{evidence['核对指纹']}",
+        "核对指纹": evidence["核对指纹"],
+        "汇总序号": evidence["汇总序号"],
+        "成功数": evidence["成功数"],
+        "总数": evidence["总数"],
+        "失败数": evidence["失败数"],
+        "成功率": str(evidence["成功率"]),
+        "执行集合": evidence["执行集合"],
+        "核对结论": conclusion,
+        "提交状态": submission_state,
     }
-    audit_result, _ = audit_svc.create_entry(audit_values)
+    return audit_svc.upsert_metric_audit(
+        metric_id, metric.get("读数编号", ""), audit_values
+    )
+
+
+def summarize_metrics(metric_id: int, *, defer_audit: bool = False) -> dict[str, Any]:
+    """按统计窗口汇总流程执行指标，逐条核对执行实例并落审计证据。
+
+    defer_audit=True 表示暂缓这次核对的提交（证据已登记、序号已预留），
+    需随后调用 commit_metric_summary 完成提交。
+    """
+    metric_svc = service_for("metric_board")
+    metric = _find_entry("metric_board", metric_id)
+
+    # 深拷贝执行集合做快照，后续执行状态变化不影响本次核对依据
+    snapshot = metric_svc.build_run_snapshot()
+    check_result = _build_check_result(metric, snapshot)
+
+    # 登记/复用核对证据（按快照指纹判重），暂缓提交时预留序号
+    evidence = metric_svc.reserve_evidence(
+        metric_id, snapshot, check_result, held=defer_audit
+    )
+    duplicate = int(evidence.get("命中次数", 1)) > 1
+
+    # 相同核对只保留一条审计；暂缓提交时审计先挂起
+    submission_state = "待提交" if defer_audit else "已提交"
+    audit, reused = _register_metric_audit(
+        metric_id, metric, evidence, check_result, submission_state
+    )
+
+    applied = False
+    if not defer_audit:
+        # 读数按汇总序号单调推进，迟到的旧汇总无法退回当前读数
+        applied_metric = metric_svc.apply_reading(metric_id, evidence)
+        applied = applied_metric is not None
 
     return {
         "status": "summarized",
         "metric_id": metric_id,
-        "total_runs": len(all_runs),
-        "success_rate_actual": round(actual_success_rate, 4),
-        "mismatch": mismatch,
-        "audit_id": audit_result["id"],
+        "sequence": evidence["汇总序号"],
+        "fingerprint": evidence["核对指纹"],
+        "total_runs": snapshot["total"],
+        "success_runs": snapshot["success"],
+        "fail_runs": snapshot["fail"],
+        "success_rate_actual": snapshot["success_rate"],
+        "mismatch": not check_result["consistent"],
+        "duplicate": duplicate,
+        "audit_reused": reused,
+        "deferred": defer_audit,
+        "reading_applied": applied,
+        "audit_id": audit["id"],
+    }
+
+
+def commit_metric_summary(metric_id: int, sequence: int) -> dict[str, Any]:
+    """提交一次暂缓的指标核对。
+
+    若提交时引用的执行集合已经变化、且已有更新的汇总落地，
+    本次迟到提交将被拒收（证据保留、审计标记迟到拒收），当前读数不退回。
+    """
+    metric_svc = service_for("metric_board")
+    audit_svc = service_for("audit_trail")
+    metric = _find_entry("metric_board", metric_id)
+    evidence = metric_svc.find_evidence_by_seq(metric_id, sequence)
+    if evidence is None:
+        return {"status": "not_found", "metric_id": metric_id, "sequence": sequence}
+
+    fingerprint = evidence["核对指纹"]
+    audit = audit_svc.find_metric_audit(metric_id, fingerprint)
+    current_seq = metric_svc.current_sequence(metric_id)
+
+    # 迟到防护：序号落后于当前读数对应的汇总序号，拒绝落地
+    if sequence < current_seq:
+        metric_svc.mark_evidence(metric_id, sequence, "迟到拒收")
+        if audit is not None:
+            audit_svc.mark_submission(audit["id"], "迟到拒收")
+        return {
+            "status": "late_rejected",
+            "metric_id": metric_id,
+            "sequence": sequence,
+            "current_sequence": current_seq,
+            "reason": "迟到的核对提交：执行集合已变化且更新汇总已落地，当前读数不退回",
+        }
+
+    applied_metric = metric_svc.apply_reading(metric_id, evidence)
+    metric_svc.mark_evidence(metric_id, sequence, "已提交")
+    if audit is not None:
+        audit_svc.mark_submission(audit["id"], "已提交")
+    return {
+        "status": "committed",
+        "metric_id": metric_id,
+        "sequence": sequence,
+        "fingerprint": fingerprint,
+        "success_runs": evidence["成功数"],
+        "total_runs": evidence["总数"],
+        "reading_applied": applied_metric is not None,
+        "audit_id": audit["id"] if audit else None,
     }
